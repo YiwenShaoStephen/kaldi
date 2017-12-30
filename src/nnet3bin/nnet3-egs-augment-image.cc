@@ -32,20 +32,24 @@ enum FillMode { kNearest, kReflect };
 
 struct ImageAugmentationConfig {
   int32 num_channels;
+  //int32 arch_size;
   BaseFloat horizontal_flip_prob;
   BaseFloat horizontal_shift;
   BaseFloat vertical_shift;
   BaseFloat rotation_degree;
   BaseFloat rotation_prob;
+  BaseFloat alpha;
   std::string fill_mode_string;
 
   ImageAugmentationConfig():
       num_channels(1),
+      //arch_size(25000),
       horizontal_flip_prob(0.0),
       horizontal_shift(0.0),
       vertical_shift(0.0),
       rotation_degree(0.0),
       rotation_prob(0.0),
+      alpha(0.0),
       fill_mode_string("nearest") { }
 
 
@@ -68,6 +72,9 @@ struct ImageAugmentationConfig {
     po->Register("fill-mode", &fill_mode_string, "Mode for dealing with "
 		 "points outside the image boundary when applying transformation. "
 		 "Choices = {nearest, reflect}");
+    //po->Register("arch-size", &arch_size, "Size of archive.");
+    po->Register("alpha", &alpha, "alpha in Beta(alpha, alpha) to get lamda "
+                 "for linear interpolation in mixup.");
   }
 
   void Check() const {
@@ -324,6 +331,116 @@ void PerturbImageInNnetExample(
     KALDI_ERR << "Nnet example to perturb had no NnetIo object named 'input'";
 }
 
+float RandBeta(float alpha) {
+  std::default_random_engine generator;
+  generator.seed(RandInt(0, RAND_MAX));
+  std::gamma_distribution<double> distribution(alpha, 1.0);
+  float x = distribution(generator);
+  float number = (x / (x + distribution(generator)));
+  return number;
+}
+  
+void MixupImage(MatrixBase<BaseFloat> *image1,
+		MatrixBase<BaseFloat> *image2,
+		BaseFloat lamda) {
+  
+  int32 num_rows = image1->NumRows(),
+        num_cols = image1->NumCols(),
+        height = num_cols,
+        width = num_rows;
+  Matrix<BaseFloat> original_image(*image1);
+  for (int32 r = 0; r < width; r++) {
+    for (int32 c = 0; c < height; c++) {
+      (*image1)(r, c) = lamda * original_image(r, c) +
+	(1-lamda) * (*image2)(r, c);
+    }
+  }
+}
+
+void MixupImageInNnetExample(
+    const ImageAugmentationConfig &config,
+    NnetExample *eg1,
+    NnetExample *eg2) {
+  BaseFloat lamda = RandBeta(config.alpha);
+  KALDI_LOG << lamda;
+  int32 io_size1 = eg1->io.size(),
+    io_size2 = eg1->io.size();
+  KALDI_ASSERT(io_size1 == io_size2);
+  //bool found_input1 = false;
+  //bool found_input2 = false;
+  for (int32 i = 0; i < io_size1; i++) {
+    NnetIo &io1 = eg1->io[i];
+    if (io1.name == "input") {
+      Matrix<BaseFloat> image1;
+      io1.features.GetMatrix(&image1);
+      for (int32 j = 0; j < io_size2; j++) {
+	NnetIo &io2 = eg2->io[j];
+	if (io2.name == "input") {
+	  Matrix<BaseFloat> image2;
+	  io2.features.GetMatrix(&image2);
+	  // new mixup input image
+	  MixupImage(&image1, &image2, lamda);
+	  io1.features = image1;
+	}
+      }
+    } else if (io1.name == "output") {
+      SparseMatrix<BaseFloat> old_output1(io1.features.GetSparseMatrix());
+      const SparseVector<BaseFloat> &row1(old_output1.Row(0));
+      int32 num_classes = io1.features.NumCols();
+      int32 old_class1;
+      BaseFloat value1 = row1.Max(&old_class1); // 1.0
+      for (int32 j = 0; j < io_size2; j++) {
+	NnetIo &io2 = eg2->io[j];
+	if (io2.name == "output") {
+	  SparseMatrix<BaseFloat> old_output2(io2.features.GetSparseMatrix());
+	  const SparseVector<BaseFloat> &row2(old_output2.Row(0));
+	  int32 old_class2;
+	  BaseFloat value2 = row2.Max(&old_class2); //1.0
+	  // new mixup output
+	  BaseFloat new_value1 = lamda * value1,
+	    new_value2 = (1-lamda) * value2;
+	  std::vector<std::vector<std::pair<MatrixIndexT, BaseFloat> > > new_pairs(1);
+	  new_pairs[0].push_back(std::pair<MatrixIndexT, BaseFloat>(old_class1, new_value1));
+	  new_pairs[0].push_back(std::pair<MatrixIndexT, BaseFloat>(old_class2, new_value2));
+       	  SparseMatrix<BaseFloat> new_output(num_classes, new_pairs);
+	  // for (int32 k=0; k < new_pairs[0].size(); k++) {
+	  //   KALDI_LOG << new_pairs[0][k].first << " " << new_pairs[0][k].second;
+	  // }
+	  io2.features.SwapSparseMatrix(&new_output);
+	}
+      }
+    }
+  }  
+}
+
+// std::string GetRandomKey(const ImageAugmentationConfig &config) {
+//   int32 range = config.arch_size;
+//   int32 number = RandInt(1, range);
+//   std::string key = std::to_string(number);
+//   int32 key_length = key.length(),
+//     full_length = std::to_string(range).length();
+//   for (int i = 0; i < full_length - key_length; i++) {
+//     key = '0' + key;
+//   }
+//   return key;
+// }
+  
+
+// std::vector<std::string> GetKeyList(SequentialNnetExampleReader *example_reader) {
+//   std::vector<std::string> keylist;
+//   for (; !example_reader->Done(); example_reader->Next()) {
+//     std::string key = example_reader->Key();
+//     keylist.push_back(key);
+//     KALDI_LOG << key;
+//   }
+//   return keylist;
+// }
+
+// std::string GetRandomKey(std::vector<std::string> keylist) {
+//   int64 list_size = keylist.size();
+//   int64 random_index = RandInt(0, list_size-1);
+//   return keylist[random_index];
+// }
 
 } // namespace nnet3
 } // namespace kaldi
@@ -374,15 +491,35 @@ int main(int argc, char *argv[]) {
         examples_wspecifier = po.GetArg(2);
 
     SequentialNnetExampleReader example_reader(examples_rspecifier);
+      //example_reader_tmp(examples_rspecifier);
     NnetExampleWriter example_writer(examples_wspecifier);
+    //RandomAccessNnetExampleReader example_reader2(examples_rspecifier);
+    //std::vector<std::string> keylist = GetKeyList(&example_reader_tmp);
 
-
+    // for (int32 i=1; i<=300; i++) {
+    //   std::string key = std::to_string(i);
+    //   int32 key_length = key.length();
+    //   for (int32 z=0; z<(5-key_length); z++) {
+    // 	key = '0' + key;
+    //   }
+    //   if (example_reader2.HasKey(key)) {
+    // 	KALDI_LOG << "has key "<< key;
+    //   } else {
+    // 	KALDI_LOG << "no such key " << key;
+ 
+    
     int64 num_done = 0;
-    for (; !example_reader.Done(); example_reader.Next(), num_done++) {
+    for (; !example_reader.Done(); num_done++) {
       std::string key = example_reader.Key();
       NnetExample eg(example_reader.Value());
-      PerturbImageInNnetExample(config, &eg);
+      example_reader.Next();
+      NnetExample eg2(example_reader.Value());
+      std::string key2 = example_reader.Key();
+      MixupImageInNnetExample(config, &eg, &eg2);
       example_writer.Write(key, eg);
+      KALDI_LOG << "Mixup " << key << " with " << key2;
+      //PerturbImageInNnetExample(config, &eg);
+      //example_writer.Write(key, eg);
     }
     KALDI_LOG << "Perturbed " << num_done << " neural-network training images.";
     return (num_done == 0 ? 1 : 0);
